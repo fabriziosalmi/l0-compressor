@@ -380,6 +380,105 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     }
 }
 
+/// How many tail lines to show: the success tail on exit 0, the (larger) error
+/// tail otherwise. The buffer retained enough lines for either, so this trims,
+/// never expands.
+///
+/// Clean-success squelch: on a zero exit with no error/warning signal anywhere
+/// in the stream, trim the success tail further — a clean build/test/install's
+/// middle is progress noise. Any signal (or a non-zero exit) keeps the full tail
+/// so failures stay fully visible.
+pub fn display_tail_for(
+    exit_code: i32,
+    squelch: bool,
+    saw_error_signal: bool,
+    tail_cap: usize,
+    tail_error_cap: usize,
+) -> usize {
+    if exit_code != 0 {
+        tail_error_cap
+    } else if squelch && !saw_error_signal {
+        crate::filter::squelched_tail(tail_cap)
+    } else {
+        tail_cap
+    }
+}
+
+/// The footer appended to truncated output. The mid-output
+/// "... [N lines omitted for LLM] ..." marker (from the filter) already states
+/// the gap; this adds only run metadata, the head/tail summary, and — when a
+/// copy of the full output exists — where to read the omitted lines.
+/// `exit_code` is `None` when the caller does not know it (the agent hook only
+/// sees output the agent already classified as a success).
+pub fn truncation_banner(
+    output: &str,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    head: usize,
+    display_tail: usize,
+    lines_raw: usize,
+    full_output: Option<&std::path::Path>,
+) -> String {
+    let separator = if output.is_empty() || output.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let exit = exit_code.map_or_else(String::new, |c| format!("exit_code={}, ", c));
+    let mut banner = format!(
+        "{}\n... [l0-compressor: {}duration={}ms, truncated=true] ...\n... [Showing {} head + {} tail of {} lines] ...\n",
+        separator, exit, duration_ms, head, display_tail, lines_raw
+    );
+    if let Some(path) = full_output {
+        banner.push_str(&format!(
+            "... [l0-compressor: full output saved to {} — read it for the omitted lines] ...\n",
+            path.display()
+        ));
+    }
+    banner
+}
+
+/// Filter an already-captured, successful (exit 0) output buffer through the
+/// same line normalization and pipeline [`run_captured`] applies to a live
+/// child. Used by the agent hook, which receives the output after the command
+/// ran. Returns `None` for binary-looking output (left to the caller untouched)
+/// plus the tail actually displayed.
+pub fn filter_captured_success(
+    data: &[u8],
+    head_cap: usize,
+    tail_cap: usize,
+    threshold: usize,
+    only_errors: bool,
+    squelch: bool,
+    recovery: &mut Recovery,
+) -> Option<(FilterResult, usize)> {
+    let retain_tail = tail_cap.max(
+        threshold
+            .saturating_sub(head_cap)
+            .min(RETAIN_COMPLETENESS_CAP),
+    );
+    let mut pipe = FilterPipeline::new(head_cap, retain_tail, only_errors);
+    let mut reader = BufReader::new(data);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut sniffed = 0usize;
+    while read_line_bytes(&mut reader, &mut line_buf, true).is_some() {
+        if sniffed < 8192 {
+            sniffed += line_buf.len() + 1;
+            if filter::looks_binary(&line_buf) {
+                return None;
+            }
+        }
+        let stripped = filter::strip_ansi(&line_buf);
+        recovery.feed(&stripped);
+        pipe.feed(stripped);
+    }
+    let display_tail = display_tail_for(0, squelch, pipe.saw_error_signal(), tail_cap, tail_cap);
+    Some((
+        pipe.finish(threshold, data.len(), display_tail),
+        display_tail,
+    ))
+}
+
 /// Run a command in capture mode: merge streams, filter, return result.
 #[allow(clippy::too_many_arguments)]
 pub fn run_captured(
@@ -609,22 +708,13 @@ pub fn run_captured(
         })
     } else {
         let pipe = pipeline.unwrap();
-        // Show the success tail on exit 0, the (larger) error tail otherwise.
-        // The buffer retained `retain_tail` lines, so this trims, never expands.
-        //
-        // Clean-success squelch: on a zero exit with no error/warning signal
-        // anywhere in the stream, trim the success tail further — a clean
-        // build/test/install's middle is progress noise. Any signal (or a
-        // non-zero exit) keeps the full tail so failures stay fully visible.
-        let display_tail = if exit_code == 0 {
-            if squelch && !pipe.saw_error_signal() {
-                crate::filter::squelched_tail(tail_cap)
-            } else {
-                tail_cap
-            }
-        } else {
-            tail_error_cap
-        };
+        let display_tail = display_tail_for(
+            exit_code,
+            squelch,
+            pipe.saw_error_signal(),
+            tail_cap,
+            tail_error_cap,
+        );
 
         let mut filter_result = pipe.finish(threshold, raw_bytes_total, display_tail);
         if killed_by_watchdog {

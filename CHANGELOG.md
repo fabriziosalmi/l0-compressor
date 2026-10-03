@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-03
+
+### Security
+- **The Claude Code hook no longer rewrites commands.** Up to 0.3.0 it was a
+  `PreToolUse` hook turning `cmd` into `l0-compressor --quiet --recover cmd`.
+  Claude Code evaluates permission rules against the rewritten command, so
+  `allow` rules stopped matching (commands that never prompted started
+  prompting) and so did `deny`/`ask` rules: under `bypassPermissions`, a command
+  matching a `deny` rule such as `Bash(seq *)` ran (reproduced on Claude Code
+  2.1.285). Re-run `claude-hook.sh install` to migrate.
+- Metrics now redact compound credential variable names in command prefixes
+  (`GITHUB_TOKEN=…`, `AWS_SECRET_ACCESS_KEY=…`, `PGPASSWORD=…`); only bare names
+  such as `PASSWORD=` were redacted before.
+
+### Added
+- **`l0-compressor --claude-hook`**: a Claude Code `PostToolUse` hook that
+  filters the output of successful Bash calls through the CLI's pipeline and
+  returns it as `updatedToolOutput`. The command, its permission check and its
+  execution are untouched. Outputs Claude Code persisted (over ~30 KB) are
+  filtered from the full file and the footer points at it; smaller truncated
+  outputs get a private recovery file. Unknown payload shapes, failures,
+  interrupted/image calls and short outputs are left alone. Hook runs are
+  recorded with strategy `claude_hook`.
+
+### Changed
+- `claude-hook.sh install` registers `"<abs path>/l0-compressor" --claude-hook`
+  under `PostToolUse` (absolute path, so it works in editors launched without
+  the shell `PATH`), removes the old `PreToolUse` wrapper, and refuses a binary
+  without the hook mode. `status` reports the registered binary's version and
+  flags a leftover old hook. `agent-hook.sh install claude` hands off to it;
+  the Gemini CLI integration is unchanged.
+- Failures are not filtered by the hook: Claude Code's `PostToolUseFailure`
+  cannot replace output. Auto-tuning does not learn from hook runs.
+
 ## [0.3.0] - 2026-07-07
 
 ### Added

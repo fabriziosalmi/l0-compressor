@@ -58,8 +58,8 @@ to understand what happened.
 - **Universal**: works with any command, no per-tool parsers
 - **Unintrusive**: the binary never rewrites your shell, aliases, or `$PATH` --
   you invoke it explicitly. An optional, off-by-default
-  [Claude Code hook](./claude-code) can do the prefixing for you, and is just as
-  conservative about what it touches.
+  [Claude Code hook](./claude-code) filters what Claude reads after a command
+  ran, without rewriting the command or touching its permission check.
 - **Safe**: never modifies the child command's behavior. The one deliberate
   exception is the [safety guard](/reference/#safety-guard), which refuses to
   run a small set of clearly destructive commands (exit 126) when an

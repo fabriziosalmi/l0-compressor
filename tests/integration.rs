@@ -1835,9 +1835,10 @@ fn isolated_run_writes_metric_into_its_own_xdg() {
     let _ = std::fs::remove_dir_all(&xdg);
 }
 
-/// The Claude-hook wrapper's skip-list: zero-output builtins are not wrapped,
-/// real commands are. Exercises the heredoc-generated wrapper extracted from
-/// claude-hook.sh (the front line against zero-output telemetry pollution).
+/// The command-rewriting wrapper's skip-list (Gemini CLI): zero-output builtins
+/// are not wrapped, real commands are. Exercises the heredoc-generated wrapper
+/// extracted from agent-hook.sh (the front line against zero-output telemetry
+/// pollution).
 #[test]
 fn hook_wrapper_skips_builtins_and_wraps_commands() {
     // jq is a hard dependency of the wrapper; skip the test where absent.
@@ -1847,7 +1848,7 @@ fn hook_wrapper_skips_builtins_and_wraps_commands() {
     }
     let t = get_t_bin();
     let hook_src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-hook.sh"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent-hook.sh"),
     )
     .unwrap();
     let start = hook_src.find("<<'WRAP'").expect("WRAP heredoc start") + "<<'WRAP'".len();
@@ -1859,7 +1860,13 @@ fn hook_wrapper_skips_builtins_and_wraps_commands() {
 
     let dir = temp_xdg("hook-wrapper");
     let wrapper = dir.join("wrapper.sh");
-    std::fs::write(&wrapper, wrapper_body.trim_start()).unwrap();
+    // agent-hook.sh writes the agent's output program above the heredoc body.
+    let gemini_output = "OUTPUT_JQ='{hookSpecificOutput: {tool_input: {command: $new}}}'\n";
+    std::fs::write(
+        &wrapper,
+        format!("{gemini_output}{}", wrapper_body.trim_start()),
+    )
+    .unwrap();
     // Toggle file + PATH with the freshly built binary visible as `l0-compressor`.
     let cfg = dir.join("config");
     std::fs::create_dir_all(cfg.join("l0-compressor")).unwrap();
@@ -1906,5 +1913,175 @@ fn hook_wrapper_skips_builtins_and_wraps_commands() {
         out.contains("l0-compressor --quiet --recover seq 1 100"),
         "real command must be wrapped, got: {out}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes the PostToolUse payload Claude Code sends after a successful Bash call.
+fn claude_post_payload(stdout: &str) -> String {
+    serde_json::json!({
+        "session_id": "s",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "seq 1 500", "description": "numbers"},
+        "tool_response": {
+            "stdout": stdout,
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false
+        },
+        "duration_ms": 7
+    })
+    .to_string()
+}
+
+fn run_claude_hook(
+    xdg_config: &std::path::Path,
+    xdg_data: &std::path::Path,
+    stdin: &str,
+) -> (i32, String, String) {
+    use std::io::Write as _;
+    let mut child = Command::new(get_t_bin())
+        .arg("--claude-hook")
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("XDG_DATA_HOME", xdg_data)
+        .env("CLAUDE_CONFIG_DIR", xdg_config.join("claude"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `--claude-hook` end to end through the binary: silent and exit 0 unless the
+/// toggle is on; with it on, a long output becomes a PostToolUse response in
+/// the shape Claude Code accepts, and the run is recorded in the metrics.
+#[test]
+fn claude_hook_mode_end_to_end() {
+    let dir = temp_xdg("claude-hook");
+    let cfg = dir.join("config");
+    let data = dir.join("data");
+    let long: String = (1..=500).map(|i| format!("{i}\n")).collect();
+
+    // Toggle off: no output whatever the payload.
+    let (code, out, err) = run_claude_hook(&cfg, &data, &claude_post_payload(&long));
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+
+    std::fs::create_dir_all(cfg.join("l0-compressor")).unwrap();
+    std::fs::write(cfg.join("l0-compressor").join("hook.enabled"), "").unwrap();
+
+    // Garbage, empty and short payloads: still silent, still exit 0.
+    for stdin in ["", "not json", "{}", &claude_post_payload("1\n2\n3\n")] {
+        let (code, out, _) = run_claude_hook(&cfg, &data, stdin);
+        assert_eq!((code, out.as_str()), (0, ""), "stdin: {stdin:?}");
+    }
+
+    let (code, out, err) = run_claude_hook(&cfg, &data, &claude_post_payload(&long));
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(err.is_empty(), "the hook must not write to stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON object");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let updated = &v["hookSpecificOutput"]["updatedToolOutput"];
+    let stdout = updated["stdout"].as_str().unwrap();
+    assert!(stdout.contains("lines omitted"), "{stdout}");
+    assert!(stdout.contains("\n500\n"), "{stdout}");
+    assert!(stdout.len() < long.len());
+    assert_eq!(updated["stderr"], "");
+    assert_eq!(updated["interrupted"], false);
+    assert_eq!(updated["isImage"], false);
+
+    let metrics =
+        std::fs::read_to_string(data.join("l0-compressor").join("metrics.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = metrics
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the filtered call is recorded: {metrics}"
+    );
+    assert_eq!(rows[0]["cmd"], "seq");
+    assert_eq!(rows[0]["strategy"], "claude_hook");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// claude-hook.sh install: registers `<abs bin> --claude-hook` under
+/// PostToolUse, migrates away the old PreToolUse command-rewriting wrapper,
+/// keeps unrelated hooks, and is idempotent; uninstall removes only ours.
+#[test]
+fn claude_hook_script_installs_posttooluse_and_migrates() {
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipping: jq not installed");
+        return;
+    }
+    let dir = temp_xdg("claude-hook-sh");
+    let claude = dir.join("claude");
+    std::fs::create_dir_all(claude.join("hooks")).unwrap();
+    let legacy = claude.join("hooks").join("l0-compressor-wrapper.sh");
+    std::fs::write(&legacy, "#!/bin/sh\n").unwrap();
+    let settings = claude.join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::json!({
+            "permissions": {"deny": ["Bash(git push *)"]},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": legacy.to_str().unwrap()}]},
+                    {"matcher": "Edit", "hooks": [{"type": "command", "command": "/x/other.sh"}]}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-hook.sh");
+    let run = |action: &str| {
+        let out = Command::new("bash")
+            .arg(&script)
+            .arg(action)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("L0_COMPRESSOR_BIN", get_t_bin())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{action}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run("install");
+    run("install");
+    let s: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let post = s["hooks"]["PostToolUse"].as_array().unwrap();
+    assert_eq!(post.len(), 1, "idempotent: {s}");
+    assert_eq!(post[0]["matcher"], "Bash");
+    let cmd = post[0]["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmd, format!("\"{}\" --claude-hook", get_t_bin().display()));
+    let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1, "legacy rewrite removed, other hook kept: {s}");
+    assert_eq!(pre[0]["matcher"], "Edit");
+    assert!(!legacy.exists(), "legacy wrapper file removed");
+    assert_eq!(s["permissions"]["deny"][0], "Bash(git push *)");
+
+    run("uninstall");
+    let s: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Edit");
     let _ = std::fs::remove_dir_all(&dir);
 }

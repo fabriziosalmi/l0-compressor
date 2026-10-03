@@ -110,6 +110,11 @@ pub struct Args {
     #[arg(long)]
     pub doctor: bool,
 
+    /// Run as a Claude Code PostToolUse hook: read the hook payload on stdin and
+    /// print a filtered `updatedToolOutput` (or nothing). Installed by claude-hook.sh.
+    #[arg(long)]
+    pub claude_hook: bool,
+
     /// Floor for success optimization decay under --auto.
     #[arg(long, default_value_t = 10)]
     pub auto_floor: usize,
@@ -295,6 +300,27 @@ fn is_secret_flag_name(flag: &str) -> bool {
     )
 }
 
+/// Whether an environment variable name holds a credential. Unlike flags,
+/// variable names compose freely (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+/// `DB_PASSWORD`, `PGPASSWORD`), so this matches on name parts rather than the
+/// whole name: distinctive words anywhere, short ambiguous ones (`KEY`, `AUTH`,
+/// `PASS`) only at the start of an `_`-separated segment.
+fn is_secret_env_name(name: &str) -> bool {
+    const ANYWHERE: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "BEARER",
+    ];
+    const SEGMENT_START: &[&str] = &["KEY", "AUTH", "PASS"];
+    let n = name.to_ascii_uppercase();
+    ANYWHERE.iter().any(|w| n.contains(w))
+        || n.split('_')
+            .any(|seg| SEGMENT_START.iter().any(|p| seg.starts_with(p)))
+}
+
 /// Redact `user:pass` userinfo from a URL argument: `scheme://u:p@host` → `scheme://***@host`.
 fn redact_url_userinfo(arg: &str) -> String {
     if let Some(scheme_end) = arg.find("://") {
@@ -320,10 +346,10 @@ fn redact_secret_args(args: &[String]) -> String {
             redact_next = false;
             continue;
         }
-        // `--flag=value` form.
+        // `--flag=value` form, and `NAME=value` environment assignments.
         if let Some(eq) = arg.find('=') {
             let name = &arg[..eq];
-            if is_secret_flag_name(name) {
+            if is_secret_flag_name(name) || (is_env_assignment(arg) && is_secret_env_name(name)) {
                 out.push(format!("{}=***", name));
                 continue;
             }
@@ -397,6 +423,30 @@ mod tests {
         assert_eq!(args.cmd_args_string(), "FOO=bar");
         let args = Args::parse_from(["t", "FOO=bar"]);
         assert_eq!(args.cmd_name(), "(none)");
+    }
+
+    /// Credential-bearing variable names are compound (`GITHUB_TOKEN`), not
+    /// the bare flag names `is_secret_flag_name` knows; the Claude Code hook
+    /// records every command the agent runs, so these must not leak either.
+    #[test]
+    fn compound_secret_env_names_are_redacted() {
+        for (assign, secret) in [
+            ("API_TOKEN=hunter2", "hunter2"),
+            ("GITHUB_TOKEN=ghp_abc", "ghp_abc"),
+            ("AWS_SECRET_ACCESS_KEY=wJalr", "wJalr"),
+            ("DB_PASSWORD=pw1", "pw1"),
+            ("OPENAI_API_KEY=sk-1", "sk-1"),
+            ("PGPASSWORD=pw2", "pw2"),
+            ("HTTP_AUTH_HEADER=b64", "b64"),
+        ] {
+            let a = Args::parse_from(["t", "sh", "-c", &format!("{assign} deploy --go")]);
+            let rendered = a.cmd_args_string();
+            assert!(!rendered.contains(secret), "{assign} leaked: {rendered}");
+            assert_eq!(a.cmd_name(), "deploy");
+        }
+        // Ordinary assignments stay readable.
+        let a = Args::parse_from(["t", "sh", "-c", "RUST_LOG=debug NODE_ENV=test cargo test"]);
+        assert_eq!(a.cmd_args_string(), "RUST_LOG=debug NODE_ENV=test test");
     }
 
     #[test]
