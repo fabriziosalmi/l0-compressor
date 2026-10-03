@@ -399,31 +399,37 @@ formats skip unparseable lines), never fatal.
 
 Normally you (or your AI assistant) prefix a command with `l0-compressor` explicitly.
 For [Claude Code](https://claude.com/claude-code), the bundled `claude-hook.sh`
-can do that **for you, transparently**: it installs a
-[`PreToolUse`](https://docs.claude.com/en/docs/claude-code/hooks) hook that
-rewrites the *simple* Bash commands Claude Code runs so they go through
-`l0-compressor` — the model never has to prefix anything.
+does it **transparently**: it registers a
+[`PostToolUse`](https://code.claude.com/docs/en/hooks#posttooluse) hook that
+filters the output of every successful Bash call before Claude reads it — the
+model never has to prefix anything, and works the same in the CLI, the VS Code
+extension and the desktop app (they share `~/.claude/settings.json`).
 
-It is **off by default** and designed to stay out of the way:
+The command itself is **never rewritten**. It runs, is permission-checked, and
+is recorded exactly as it would be without l0-compressor; the hook only replaces
+the text Claude reads afterwards (`updatedToolOutput`). Your `allow`, `ask` and
+`deny` rules keep matching the real command, and read-only commands Claude Code
+approves on its own (`ls`, `cat`, `git log`, …) stay approved.
 
-- **Conservative** — only a single, simple program invocation is ever wrapped.
-  Anything with shell operators (`&&`, `||`, `;`, `|`, redirects, `$(...)`,
-  backticks, `&`), multiple lines, stateful builtins (`cd`, `export`, `source`,
-  `eval`, `exec`, `set`, …), shell constructs (`for`/`while`/`if`/`case`), or
-  interactive/TUI/REPL programs (`vim`, `less`, `ssh`, `python`, `psql`, …) is
-  passed through **untouched**. Already-wrapped commands are left as-is.
-- **Fail-safe** — if `l0-compressor` or `jq` is missing, or anything errors, the
-  command runs unchanged. The hook never blocks a command and never sets a
-  `permissionDecision`, so wrapped commands still go through your normal
-  Claude Code permissions.
+- **Only when it pays** — output under the truncation threshold (100 lines by
+  default) is left exactly as Claude Code captured it.
+- **Nothing is lost** — when output is truncated, the footer points at a full
+  copy: Claude Code's own saved file for outputs over ~30 KB, otherwise a
+  private (`0600`) recovery file.
+- **Fail-safe** — any unexpected payload, I/O error or panic produces no
+  response, and Claude reads the original output.
 - **Runtime toggle** — enable/disable instantly, no restart.
 
+Limits, set by Claude Code's hook API: a command that **fails** (non-zero exit)
+fires `PostToolUseFailure`, whose output cannot be replaced, so failures reach
+Claude unfiltered; and auto-tuning does not learn from hook runs.
+
 ```sh
-./claude-hook.sh install     # write the wrapper + register the hook (idempotent; needs jq)
+./claude-hook.sh install     # register the hook (idempotent; needs jq)
 ./claude-hook.sh enable      # turn it ON  (instant)
 ./claude-hook.sh disable     # turn it OFF (instant)
-./claude-hook.sh status      # show install/enabled state + l0-compressor version
-./claude-hook.sh uninstall   # remove the hook registration and wrapper
+./claude-hook.sh status      # show registration, hook binary version, on/off state
+./claude-hook.sh uninstall   # remove the hook registration
 ```
 
 > **Installed via Homebrew?** The same script ships as the `l0-compressor-claude-hook`
@@ -437,26 +443,39 @@ It is **off by default** and designed to stay out of the way:
 > **new** Claude Code session so the hook is loaded — hooks are read at session
 > startup. The `enable`/`disable` toggle then takes effect immediately.
 
-The hook honors `$CLAUDE_CONFIG_DIR` and `$XDG_CONFIG_HOME`. It edits Claude
-Code's `settings.json` (saving a timestamped backup) and stores its on/off state
-as an empty toggle file at `~/.config/l0-compressor/hook.enabled`.
+The hook is registered with the **absolute path** of `l0-compressor` (or
+`$L0_COMPRESSOR_BIN`), so it runs even where `PATH` differs, such as the VS Code
+extension launched from the Dock; re-run `install` if the binary moves. The
+script honors `$CLAUDE_CONFIG_DIR` and `$XDG_CONFIG_HOME`, edits Claude Code's
+`settings.json` (saving a timestamped backup) and stores its on/off state as an
+empty toggle file at `~/.config/l0-compressor/hook.enabled`.
+
+> [!WARNING]
+> **Upgrading from 0.3.x:** the previous integration was a `PreToolUse` hook
+> that rewrote `cmd` into `l0-compressor … cmd`. Claude Code evaluates
+> permission rules against the rewritten command, so `allow` rules stopped
+> matching and — under `bypassPermissions` — a command matching a `deny` rule
+> ran anyway. Re-run `install`: it removes the old hook and registers the new
+> one. `status` flags the old hook if it is still present.
 
 > [!NOTE]
 > `l0-compressor` is not a persistent cache — it filters output on the fly and does
-> not store results to replay. The only thing written to disk is the metrics log
-> (see [Metrics](#metrics)). If a session shows no savings, the hook simply
-> never wrapped a command in it — confirm with `l0-compressor --stats` and
+> not store results to replay. Hook runs appear in `l0-compressor --stats` (strategy
+> `claude_hook` in the JSON). If a session shows no savings, it was started before
+> the hook was installed or enabled, or its outputs were all short — confirm with
 > `./claude-hook.sh status`.
 
 ### Other agents (Gemini CLI)
 
-Transparent wrapping needs a hook that can **rewrite** the command. Two agents
-support that today — **Claude Code** (`PreToolUse`) and **Gemini CLI**
-(`BeforeTool`/`run_shell_command`) — and `agent-hook.sh` installs the same
-conservative, fail-safe wrapper for either (it also enables `--recover`):
+For Gemini CLI, `agent-hook.sh` installs a conservative, fail-safe wrapper on
+`BeforeTool`/`run_shell_command` that **rewrites** simple commands into
+`l0-compressor --quiet --recover <cmd>` before they run. Unlike the Claude Code
+integration it changes the command Gemini sees, so check that your Gemini
+policy rules still match the rewritten form. `agent-hook.sh install claude`
+(the default) hands off to `claude-hook.sh`.
 
 ```sh
-./agent-hook.sh install gemini    # or: install claude   (default)
+./agent-hook.sh install gemini    # or: install claude   (default → claude-hook.sh)
 ./agent-hook.sh enable            # shared on/off toggle for all installed agents
 ./agent-hook.sh status gemini
 ```
@@ -492,6 +511,11 @@ the guard's decision function, so it never runs a real `rm`). Documented
 residual limits: command substitution / `eval`, glob expansion, targets via
 stdin (`… | xargs rm -rf`), other destructive tools (`find -delete`, `dd`,
 `shred`), symlinked aliases.
+
+The guard runs only when `l0-compressor` itself launches the command. The
+[Claude Code integration](#claude-code-integration-optional) filters output
+*after* Claude Code ran the command, so there the guard never applies — Claude
+Code's own permission rules are the control.
 
 Control it explicitly with `--guard` / `--no-guard`, or the `L0_COMPRESSOR_GUARD`
 environment variable (`1`/`true`/`on` to force on, `0`/`false`/`off` to force off).

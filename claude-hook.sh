@@ -2,25 +2,26 @@
 # ==============================================================================
 # claude-hook.sh — manage the transparent l0-compressor integration for Claude Code.
 #
-# NOTE: for multiple agents (Claude Code AND Gemini CLI) use `agent-hook.sh`,
-# which generalizes this script. This one stays as a Claude-only convenience.
-#
-# Installs a PreToolUse hook that routes *simple* Bash commands Claude Code runs
-# through `l0-compressor` (to cut token usage), without the model prefixing anything.
-# It is conservative (compound/piped/interactive/stateful commands pass through
-# untouched), fail-safe (any error → the command runs unchanged), and OFF by
-# default — toggle it on/off at runtime with no restart.
+# Registers a PostToolUse hook (`l0-compressor --claude-hook`) that filters the
+# output of successful Bash tool calls before Claude reads it. The command
+# itself is never rewritten, so Claude Code's permission rules (allow / ask /
+# deny) and execution are exactly what they would be without l0-compressor.
+# Fail-safe (any error → Claude reads the original output) and OFF by default —
+# toggle it on/off at runtime with no restart.
 #
 # Usage:
-#   ./claude-hook.sh install     Install the wrapper + register the hook (idempotent)
+#   ./claude-hook.sh install     Register the hook (idempotent; migrates the old one)
 #   ./claude-hook.sh enable      Turn the hook ON  (create the toggle file)
 #   ./claude-hook.sh disable     Turn the hook OFF (remove the toggle file)
 #   ./claude-hook.sh status      Show install / enabled state + l0-compressor version
-#   ./claude-hook.sh uninstall   Remove the hook registration and wrapper script
+#   ./claude-hook.sh uninstall   Remove the hook registration
 #   ./claude-hook.sh help
 #
 # Notes:
 #   * `install`/`uninstall` edit Claude Code's settings.json and need `jq`.
+#   * The hook is registered with the absolute path of `l0-compressor` (or
+#     $L0_COMPRESSOR_BIN), so it works where PATH differs — e.g. the VS Code
+#     extension started from the Dock. Re-run `install` if the binary moves.
 #   * After install (or after changing settings), start a NEW Claude Code session
 #     so the hook is loaded. The enable/disable toggle is then instant.
 #   * Honors $CLAUDE_CONFIG_DIR and $XDG_CONFIG_HOME.
@@ -33,11 +34,13 @@ _l0_tmp=""
 trap 'rm -f "$_l0_tmp"' EXIT
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-HOOKS_DIR="$CLAUDE_DIR/hooks"
 SETTINGS="$CLAUDE_DIR/settings.json"
-WRAPPER="$HOOKS_DIR/l0-compressor-wrapper.sh"
 TOGGLE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/l0-compressor"
 TOGGLE="$TOGGLE_DIR/hook.enabled"
+# The pre-0.4 integration: a PreToolUse wrapper that rewrote the command. It
+# made Claude Code evaluate permission rules against `l0-compressor <cmd>`
+# instead of `<cmd>`, so `install`/`uninstall` remove it.
+LEGACY_WRAPPER="$CLAUDE_DIR/hooks/l0-compressor-wrapper.sh"
 
 # Color only on an interactive terminal with NO_COLOR unset.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -54,98 +57,84 @@ need_jq() {
   command -v jq >/dev/null 2>&1 || { err "jq is required for this command. Install it (e.g. 'brew install jq' / 'apt-get install jq')."; exit 1; }
 }
 
-write_wrapper() {
-  mkdir -p "$HOOKS_DIR"
-  cat > "$WRAPPER" <<'WRAP'
-#!/usr/bin/env bash
-# Claude Code PreToolUse hook — transparently route simple Bash commands through
-# `l0-compressor`. CONSERVATIVE + FAIL-SAFE + OFF by default. Managed by claude-hook.sh.
-# Toggle:  touch ~/.config/l0-compressor/hook.enabled   (on)
-#          rm -f ~/.config/l0-compressor/hook.enabled   (off)
-toggle="${XDG_CONFIG_HOME:-$HOME/.config}/l0-compressor/hook.enabled"
-[ -f "$toggle" ] || exit 0
-command -v l0-compressor >/dev/null 2>&1 || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
+# Absolute path of the l0-compressor binary the hook will run.
+resolve_bin() {
+  local bin="${L0_COMPRESSOR_BIN:-}"
+  [ -n "$bin" ] || bin="$(command -v l0-compressor 2>/dev/null || true)"
+  [ -n "$bin" ] || { err "l0-compressor not found in PATH (or set L0_COMPRESSOR_BIN)."; exit 1; }
+  case "$bin" in
+    /*) ;;
+    *) bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" ;;
+  esac
+  [ -x "$bin" ] || { err "$bin is not executable."; exit 1; }
+  # Binaries before 0.4 do not have the hook mode.
+  "$bin" --help 2>/dev/null | grep -q -- '--claude-hook' || {
+    err "$bin has no --claude-hook mode ($("$bin" --version 2>/dev/null || echo unknown version)). Upgrade l0-compressor first."
+    exit 1
+  }
+  printf '%s\n' "$bin"
+}
 
-input="$(cat)"
-# Field paths differ slightly across agents; try the common ones, then bail.
-cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // .toolInput.command // empty' 2>/dev/null)"
-[ -n "$cmd" ] || exit 0
+# jq program: drop every hook entry that is ours — the current PostToolUse
+# `--claude-hook` command and the legacy PreToolUse wrapper — then prune
+# matcher groups and events left empty. Unrelated hooks are untouched.
+# shellcheck disable=SC2016
+JQ_DROP_OURS='
+  def ours: (.command // "") as $c
+    | ($c == $legacy) or ($c | test("l0-compressor[^ ]*\"? --claude-hook$"));
+  if .hooks then
+    .hooks |= with_entries(
+      .value |= map(.hooks = ((.hooks // []) | map(select(ours | not))))
+               | .value |= map(select((.hooks | length) > 0))
+    )
+    | .hooks |= with_entries(select((.value | length) > 0))
+    | (if .hooks == {} then del(.hooks) else . end)
+  else . end'
 
-# Already wrapped?
-case "$cmd" in
-  l0-compressor\ * | t\ * | */l0-compressor\ * | */t\ *) exit 0 ;;
-esac
-
-# Risky to wrap: shell operators, redirects, subshells, substitution, multi-line,
-# or stateful builtins that must affect the real shell.
-case "$cmd" in
-  *'&&'* | *'||'* | *';'* | *'|'* | *'>'* | *'<'* | *'`'* | *'$('* | *'&'*) exit 0 ;;
-  *$'\n'*) exit 0 ;;
-  cd | cd\ * | export\ * | source\ * | .\ * | eval\ * | exec\ * | set\ * | unset\ * | alias\ *) exit 0 ;;
-  exit | exit\ * | true | true\ * | false | false\ * | : | :\ * | wait | wait\ * | trap\ *) exit 0 ;;
-  for\ * | while\ * | until\ * | if\ * | case\ * | function\ * | '{'* | '('*) exit 0 ;;
-esac
-
-# Interactive / TUI / REPL programs: l0-compressor would capture instead of passthrough.
-first="${cmd%% *}"; first="${first##*/}"
-case "$first" in
-  vim | vi | nvim | nano | emacs | less | more | man | htop | top | btop | ssh | telnet | fzf | tmux | screen | watch | python | python3 | node | irb | psql | mysql | sqlite3 | tig | lazygit) exit 0 ;;
-esac
-
-# Wrap. Keep every other tool_input field; only the command changes. No
-# permissionDecision → wrapped commands still go through your normal permissions.
-# `--recover` saves full output to a temp file on a failing, truncated command.
-printf '%s' "$input" | jq -c \
-  --arg new "l0-compressor --quiet --recover $cmd" \
-  '{hookSpecificOutput: {hookEventName: "PreToolUse", updatedInput: (.tool_input + {command: $new})}}' 2>/dev/null || exit 0
-WRAP
-  chmod +x "$WRAPPER"
+rewrite_settings() { # $1 = jq program, remaining args passed to jq
+  local prog="$1"; shift
+  local tmp; tmp="$(mktemp)"; _l0_tmp="$tmp"
+  jq "$@" "$prog" "$SETTINGS" > "$tmp"
+  jq empty "$tmp"            # validate
+  mv "$tmp" "$SETTINGS"
 }
 
 cmd_install() {
   need_jq
-  info "Installing l0-compressor Claude Code hook..."
-  write_wrapper
-  ok "Wrapper written: $WRAPPER"
+  local bin; bin="$(resolve_bin)"
+  info "Installing l0-compressor Claude Code hook ($bin)..."
 
   mkdir -p "$CLAUDE_DIR"
   [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
   cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
 
-  # Idempotent: drop any prior entry pointing at our wrapper, then append a fresh one.
-  local tmp; tmp="$(mktemp)"; _l0_tmp="$tmp"
-  jq --arg h "$WRAPPER" '
-    .hooks.PreToolUse = (
-      ((.hooks.PreToolUse // []) | map(select((.hooks // []) | any(.command == $h) | not)))
-      + [ { matcher: "Bash", hooks: [ { type: "command", command: $h } ] } ]
-    )
-  ' "$SETTINGS" > "$tmp"
-  jq empty "$tmp"            # validate
-  mv "$tmp" "$SETTINGS"
-  ok "Registered PreToolUse(Bash) hook in $SETTINGS (backup saved)."
+  # Quote the path for the shell Claude Code runs the hook command in.
+  local hook_cmd; hook_cmd="\"$bin\" --claude-hook"
+  # Idempotent: remove our previous entries (incl. the legacy wrapper), then add one.
+  # shellcheck disable=SC2016  # $cmd is a jq variable
+  rewrite_settings "$JQ_DROP_OURS"' | .hooks.PostToolUse = ((.hooks.PostToolUse // []) + [ { matcher: "Bash", hooks: [ { type: "command", command: $cmd } ] } ])' \
+    --arg legacy "$LEGACY_WRAPPER" --arg cmd "$hook_cmd"
+  ok "Registered PostToolUse(Bash) hook in $SETTINGS (backup saved)."
+  if [ -f "$LEGACY_WRAPPER" ]; then
+    rm -f "$LEGACY_WRAPPER"
+    ok "Removed the old PreToolUse command-rewriting wrapper."
+  fi
 
   mkdir -p "$TOGGLE_DIR"
-  warn "The hook is OFF by default. Enable it with: ./claude-hook.sh enable"
-  warn "Then start a NEW Claude Code session so the hook is loaded."
+  [ -f "$TOGGLE" ] || warn "The hook is OFF by default. Enable it with: ./claude-hook.sh enable"
+  warn "Start a NEW Claude Code session so the hook is loaded."
 }
 
 cmd_uninstall() {
   need_jq
-  [ -f "$SETTINGS" ] || { warn "No settings.json at $SETTINGS — nothing to remove."; }
   if [ -f "$SETTINGS" ]; then
     cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
-    local tmp; tmp="$(mktemp)"; _l0_tmp="$tmp"
-    jq --arg h "$WRAPPER" '
-      (if .hooks.PreToolUse then .hooks.PreToolUse |= map(select((.hooks // []) | any(.command == $h) | not)) else . end)
-      | (if (.hooks.PreToolUse // []) == [] then (.hooks |= del(.PreToolUse)) else . end)
-      | (if (.hooks // {}) == {} then del(.hooks) else . end)
-    ' "$SETTINGS" > "$tmp"
-    jq empty "$tmp"
-    mv "$tmp" "$SETTINGS"
+    rewrite_settings "$JQ_DROP_OURS" --arg legacy "$LEGACY_WRAPPER"
     ok "Removed the hook registration from $SETTINGS (backup saved)."
+  else
+    warn "No settings.json at $SETTINGS — nothing to remove."
   fi
-  rm -f "$WRAPPER"; ok "Removed wrapper $WRAPPER"
+  rm -f "$LEGACY_WRAPPER"
   rm -f "$TOGGLE"; ok "Toggle cleared (hook OFF)."
   warn "Restart Claude Code to drop the hook from the running session."
 }
@@ -153,7 +142,6 @@ cmd_uninstall() {
 cmd_enable() {
   mkdir -p "$TOGGLE_DIR"; touch "$TOGGLE"
   ok "Hook ENABLED ($TOGGLE)."
-  [ -f "$WRAPPER" ] || warn "Wrapper not installed yet — run: ./claude-hook.sh install"
 }
 
 cmd_disable() {
@@ -163,12 +151,20 @@ cmd_disable() {
 
 cmd_status() {
   printf '%sl0-compressor Claude Code hook%s\n' "$c_b" "$c_0"
-  if command -v l0-compressor >/dev/null 2>&1; then ok "l0-compressor: $(l0-compressor --version 2>/dev/null)"; else err "l0-compressor: not found in PATH"; fi
-  if [ -f "$WRAPPER" ]; then ok "wrapper installed: $WRAPPER"; else warn "wrapper NOT installed (run: install)"; fi
-  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ] && jq -e --arg h "$WRAPPER" '(.hooks.PreToolUse // []) | any((.hooks // []) | any(.command == $h))' "$SETTINGS" >/dev/null 2>&1; then
-    ok "registered in settings.json"
+  if command -v l0-compressor >/dev/null 2>&1; then ok "l0-compressor: $(l0-compressor --version 2>/dev/null)"; else warn "l0-compressor: not in PATH"; fi
+  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
+    local registered
+    registered="$(jq -r '[.hooks.PostToolUse[]?.hooks[]?.command // empty | select(test("--claude-hook$"))] | first // empty' "$SETTINGS" 2>/dev/null || true)"
+    if [ -n "$registered" ]; then
+      local reg_bin="${registered% --claude-hook}"; reg_bin="${reg_bin#\"}"; reg_bin="${reg_bin%\"}"
+      ok "registered: $registered"
+      if [ -x "$reg_bin" ]; then ok "hook binary: $("$reg_bin" --version 2>/dev/null)"; else err "hook binary missing: $reg_bin — re-run install"; fi
+    else warn "NOT registered in settings.json (run: install)"; fi
+    if jq -e --arg h "$LEGACY_WRAPPER" '[.hooks.PreToolUse[]?.hooks[]?.command] | index($h)' "$SETTINGS" >/dev/null 2>&1; then
+      err "old PreToolUse command-rewriting hook still registered — run: install (it migrates)"
+    fi
   else
-    warn "NOT registered in settings.json (run: install)"
+    warn "cannot inspect settings.json (missing file or jq)"
   fi
   if [ -f "$TOGGLE" ]; then ok "state: ENABLED ($TOGGLE)"; else warn "state: DISABLED (run: enable)"; fi
 }

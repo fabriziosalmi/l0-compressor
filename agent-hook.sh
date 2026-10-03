@@ -7,10 +7,13 @@
 # (compound/piped/interactive/stateful commands pass through untouched), fail-safe
 # (any error → the command runs unchanged), and OFF by default — toggle at runtime.
 #
-# Transparent wrapping needs a hook that can *rewrite* the command. Only agents
-# whose hook API supports that are supported here:
-#   * claude  — Claude Code  (PreToolUse → updatedInput)         ~/.claude
+# Supported agents:
+#   * claude  — Claude Code: delegated to claude-hook.sh, which filters the
+#               output AFTER the command ran (PostToolUse) and never rewrites
+#               the command, so permission rules see the real command.
 #   * gemini  — Gemini CLI   (BeforeTool → hookSpecificOutput)   ~/.gemini
+#               Rewrites the command before it runs. Check that your Gemini
+#               policy rules still match the rewritten `l0-compressor <cmd>`.
 # Cursor's beforeShellExecution can only allow/deny (no rewrite), so it cannot be
 # wrapped transparently — see the docs for the manual prefix approach.
 #
@@ -198,7 +201,19 @@ cmd_status() {
 
 usage() { awk 'NR==1{next} /^[^#]/{exit} {sub(/^# ?/,""); if ($0 !~ /^=+$/) print}' "$0"; }
 
+# Claude Code has its own, post-execution integration: hand off to claude-hook.sh
+# (next to this script in a checkout, or `l0-compressor-claude-hook` from Homebrew).
+claude_hook() {
+  local here; here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -x "$here/claude-hook.sh" ]; then exec "$here/claude-hook.sh" "$@"; fi
+  if command -v l0-compressor-claude-hook >/dev/null 2>&1; then exec l0-compressor-claude-hook "$@"; fi
+  err "claude-hook.sh not found next to $0 nor l0-compressor-claude-hook in PATH."; exit 1
+}
+
 action="${1:-help}"
+case "$action:${2:-claude}" in
+  install:claude|uninstall:claude|remove:claude|status:claude) claude_hook "$action" ;;
+esac
 case "$action" in
   install)             select_agent "${2:-claude}"; cmd_install ;;
   uninstall|remove)    select_agent "${2:-claude}"; cmd_uninstall ;;

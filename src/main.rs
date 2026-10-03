@@ -10,6 +10,7 @@
 mod args;
 mod config;
 mod filter;
+mod hook;
 mod recovery;
 mod runner;
 mod telemetry;
@@ -32,6 +33,13 @@ fn main() {
         let mut cmd = <Args as clap::CommandFactory>::command();
         clap_complete::generate(shell, &mut cmd, "l0-compressor", &mut std::io::stdout());
         std::process::exit(0);
+    }
+
+    // ── Claude Code hook mode ───────────────────────────────────────────
+    // Stdout is the hook response channel: nothing else may print before this.
+    if args.claude_hook {
+        telemetry::migrate_legacy_data_dir();
+        std::process::exit(hook::run());
     }
 
     // ── One-time data-dir migration from the pre-rename `l0-cache/` location ──
@@ -267,38 +275,20 @@ fn main() {
             let mut output_to_write = result.filter_result.output.clone();
 
             if result.filter_result.truncated && result.strategy == "head_tail" {
-                // The mid-output "... [N lines omitted for LLM] ..." marker (from the
-                // filter) already states the gap; this footer adds only run metadata
-                // and the head/tail summary, so the omitted count is not repeated.
-                let head_cap = head;
-                // The ACTUAL tail shown (success vs error tail, minus any
-                // clean-success squelch) — reported by the runner so the banner
-                // never overstates what survived.
-                let tail_cap = result.display_tail;
-                let separator = if output_to_write.is_empty() || output_to_write.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                };
-                let banner = format!(
-                    "{}\n... [l0-compressor: exit_code={}, duration={}ms, truncated=true] ...\n... [Showing {} head + {} tail of {} lines] ...\n",
-                    separator,
-                    result.exit_code,
+                // `display_tail` is the ACTUAL tail shown (success vs error tail,
+                // minus any clean-success squelch) — reported by the runner so the
+                // banner never overstates what survived. The recovery path is only
+                // set on a failing, truncated run with --recover.
+                let banner = runner::truncation_banner(
+                    &output_to_write,
+                    Some(result.exit_code),
                     result.duration_ms,
-                    head_cap,
-                    tail_cap,
-                    result.filter_result.lines_raw
+                    head,
+                    result.display_tail,
+                    result.filter_result.lines_raw,
+                    result.recovery_path.as_deref(),
                 );
                 output_to_write.push_str(&banner);
-
-                // Point the agent at the saved full output (only set on a failing,
-                // truncated run with --recover), so it can read the omitted lines.
-                if let Some(path) = &result.recovery_path {
-                    output_to_write.push_str(&format!(
-                        "... [l0-compressor: full output saved to {} — read it for the omitted lines] ...\n",
-                        path.display()
-                    ));
-                }
             }
 
             let output_result = write_output(&output_to_write);
