@@ -16,7 +16,7 @@ reads after a command has finished.
 `claude-hook.sh` ships in the repository root (Homebrew installs it as
 `l0-compressor-claude-hook`). Installation requires
 [`jq`](https://jqlang.github.io/jq/) to edit `settings.json`, and an
-`l0-compressor` with the `--claude-hook` mode (0.4 or later).
+`l0-compressor` with the `--claude-hook` mode (0.3.1 or later).
 
 ```sh
 ./claude-hook.sh install     # register the hook (idempotent)
@@ -38,7 +38,7 @@ Dock or a desktop launcher may not have `~/.local/bin` on its `PATH`. Re-run
 
 | Command | Effect |
 |---|---|
-| `install` | Register a `PostToolUse` (matcher `Bash`) hook running `"<abs path>/l0-compressor" --claude-hook` in `settings.json`. Idempotent; removes the pre-0.4 `PreToolUse` wrapper; saves a timestamped backup. |
+| `install` | Register a `PostToolUse` (matcher `Bash`) hook running `"<abs path>/l0-compressor" --claude-hook` in `settings.json`. Idempotent; removes the pre-0.3.1 `PreToolUse` wrapper; saves a timestamped backup. |
 | `enable` / `on` | Create the toggle file `~/.config/l0-compressor/hook.enabled`. Instant. |
 | `disable` / `off` | Remove the toggle file. Instant. |
 | `status` | Show the registered command, the hook binary's version, the on/off state, and whether the old `PreToolUse` hook is still present. |
@@ -102,9 +102,9 @@ Any unexpected payload, I/O error or panic makes the hook exit `0` with no
 output, so Claude Code keeps the original output. The hook never blocks a
 command and never writes to stderr.
 
-## Upgrading from 0.3.x
+## Upgrading from 0.3.0 or earlier
 
-Up to 0.3.x the integration was a `PreToolUse` hook that rewrote `cmd` into
+Up to 0.3.0 the integration was a `PreToolUse` hook that rewrote `cmd` into
 `l0-compressor --quiet --recover cmd`. Claude Code evaluates permission rules
 against the rewritten command, which had two effects:
 

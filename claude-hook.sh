@@ -37,7 +37,7 @@ CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 TOGGLE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/l0-compressor"
 TOGGLE="$TOGGLE_DIR/hook.enabled"
-# The pre-0.4 integration: a PreToolUse wrapper that rewrote the command. It
+# The pre-0.3.1 integration: a PreToolUse wrapper that rewrote the command. It
 # made Claude Code evaluate permission rules against `l0-compressor <cmd>`
 # instead of `<cmd>`, so `install`/`uninstall` remove it.
 LEGACY_WRAPPER="$CLAUDE_DIR/hooks/l0-compressor-wrapper.sh"
@@ -67,7 +67,7 @@ resolve_bin() {
     *) bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" ;;
   esac
   [ -x "$bin" ] || { err "$bin is not executable."; exit 1; }
-  # Binaries before 0.4 do not have the hook mode.
+  # Binaries before 0.3.1 do not have the hook mode.
   "$bin" --help 2>/dev/null | grep -q -- '--claude-hook' || {
     err "$bin has no --claude-hook mode ($("$bin" --version 2>/dev/null || echo unknown version)). Upgrade l0-compressor first."
     exit 1

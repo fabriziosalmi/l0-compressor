@@ -4,10 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-10-03
 
 ### Security
-- **The Claude Code hook no longer rewrites commands.** Up to 0.3.x it was a
+- **The Claude Code hook no longer rewrites commands.** Up to 0.3.0 it was a
   `PreToolUse` hook turning `cmd` into `l0-compressor --quiet --recover cmd`.
   Claude Code evaluates permission rules against the rewritten command, so
   `allow` rules stopped matching (commands that never prompted started

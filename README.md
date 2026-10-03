@@ -451,7 +451,7 @@ script honors `$CLAUDE_CONFIG_DIR` and `$XDG_CONFIG_HOME`, edits Claude Code's
 empty toggle file at `~/.config/l0-compressor/hook.enabled`.
 
 > [!WARNING]
-> **Upgrading from 0.3.x:** the previous integration was a `PreToolUse` hook
+> **Upgrading from 0.3.0 or earlier:** the previous integration was a `PreToolUse` hook
 > that rewrote `cmd` into `l0-compressor … cmd`. Claude Code evaluates
 > permission rules against the rewritten command, so `allow` rules stopped
 > matching and — under `bypassPermissions` — a command matching a `deny` rule
