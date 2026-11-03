@@ -1951,12 +1951,12 @@ fn run_claude_hook(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // With the toggle off the hook exits before it reads stdin, so the child
+    // can be gone before this write lands: EPIPE is a valid outcome then.
+    // Any other write error is a failure. The callers assert on the output.
+    if let Err(e) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "stdin write: {e}");
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
